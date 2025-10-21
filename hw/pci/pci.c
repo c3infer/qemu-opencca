@@ -1483,6 +1483,9 @@ void pci_register_bar(PCIDevice *pci_dev, int region_num,
     r->address_space = type & PCI_BASE_ADDRESS_SPACE_IO
                         ? pci_get_bus(pci_dev)->address_space_io
                         : pci_get_bus(pci_dev)->address_space_mem;
+    
+    warn_report("pci_register_bar: dev=%s region_num=%d type=%x size=0x%" PRIx64 "\n",
+                pci_dev->name, region_num, type, size);
 
     if (pci_is_vf(pci_dev)) {
         PCIDevice *pf = pci_dev->exp.sriov_vf.pf;

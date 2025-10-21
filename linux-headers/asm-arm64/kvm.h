@@ -424,6 +424,8 @@ enum {
 #define KVM_CAP_ARM_RME_INIT_RIPAS_REALM	2
 #define KVM_CAP_ARM_RME_POPULATE_REALM		3
 #define KVM_CAP_ARM_RME_ACTIVATE_REALM		4
+#define KVM_CAP_ARM_RME_CUSTOM_PRINT        5
+
 
 /* List of configuration items accepted for KVM_CAP_ARM_RME_CONFIG_REALM */
 #define ARM_RME_CONFIG_RPV			0

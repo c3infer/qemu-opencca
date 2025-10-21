@@ -1,0 +1,300 @@
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 5e01794caf..d2049d4870 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -354,7 +354,7 @@ int kvm_physical_memory_addr_from_host(KVMState *s, void *ram,
+     return ret;
+ }
+ 
+-static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, bool new)
++static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, bool new) //like mmap
+ {
+     KVMState *s = kvm_state;
+     struct kvm_userspace_memory_region2 mem;
+@@ -367,6 +367,12 @@ static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, boo
+     mem.guest_memfd = slot->guest_memfd;
+     mem.guest_memfd_offset = slot->guest_memfd_offset;
+ 
++    //PRINT HERE - GPA, USER ADDR, SIZE
++    warn_report("kvm_set_user_memory_region: guest_phys_addr=0x%" PRIx64
++                " userspace_addr=0x%lx size=0x%" PRIx64,
++                mem.guest_phys_addr, mem.userspace_addr,
++                (uint64_t)slot->memory_size);
++
+     if (slot->memory_size && !new && (mem.flags ^ slot->old_flags) & KVM_MEM_READONLY) {
+         /* Set the slot size to 0 before setting the slot to the desired
+          * value. This is needed based on KVM commit 75d61fbc. */
+@@ -1429,7 +1435,7 @@ void kvm_set_max_memslot_size(hwaddr max_slot_size)
+     kvm_max_slot_size = max_slot_size;
+ }
+ 
+-static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr)
++static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr) //like mprotect
+ {
+     struct kvm_memory_attributes attrs;
+     int r;
+@@ -1440,6 +1446,10 @@ static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr)
+     attrs.size = size;
+     attrs.flags = 0;
+ 
++    //PRINT HERE - GPA, USER ADDR, SIZE
++    warn_report("kvm_set_memory_attributes: addr=0x%" HWADDR_PRIx ", size=0x%" PRIx64 ", attr=0x%" PRIx64,
++                start, size, attr);
++
+     r = kvm_vm_ioctl(kvm_state, KVM_SET_MEMORY_ATTRIBUTES, &attrs);
+     if (r) {
+         error_report("failed to set memory (0x%" HWADDR_PRIx "+0x%" PRIx64 ") "
+@@ -3287,6 +3297,11 @@ int kvm_cpu_exec(CPUState *cpu)
+             }
+             break;
+         case KVM_EXIT_MEMORY_FAULT:
++            warn_report("Memory region at GPA 0x%" PRIx64 " size 0x%" PRIx64
++                    " converted to %s",
++                    run->memory_fault.gpa, run->memory_fault.size,
++                    (run->memory_fault.flags & KVM_MEMORY_EXIT_FLAG_PRIVATE) ?
++                    "private" : "shared"); 
+             trace_kvm_memory_fault(run->memory_fault.gpa,
+                                    run->memory_fault.size,
+                                    run->memory_fault.flags);
+diff --git a/hw/misc/ivshmem-pci.c b/hw/misc/ivshmem-pci.c
+index 5a10bca633..eb773000a0 100644
+--- a/hw/misc/ivshmem-pci.c
++++ b/hw/misc/ivshmem-pci.c
+@@ -40,6 +40,8 @@
+ #include "hw/misc/ivshmem.h"
+ #include "qom/object.h"
+ 
++#include <linux/kvm.h>
++
+ #define PCI_VENDOR_ID_IVSHMEM   PCI_VENDOR_ID_REDHAT_QUMRANET
+ #define PCI_DEVICE_ID_IVSHMEM   0x1110
+ 
+@@ -117,6 +119,10 @@ struct IVShmemState {
+     /* migration stuff */
+     OnOffAuto master;
+     Error *migration_blocker;
++
++    /*protected*/
++    bool protected;
++    bool prot_applied;
+ };
+ 
+ /* registers for the Inter-VM shared memory device */
+@@ -180,6 +186,11 @@ static void ivshmem_io_write(void *opaque, hwaddr addr,
+     addr &= 0xfc;
+ 
+     IVSHMEM_DPRINTF("writing to addr " HWADDR_FMT_plx "\n", addr);
++
++    // hwaddr bar2 = pci_get_bar_addr(PCI_DEVICE(s), 2);
++
++    // warn_report("bar 2 at " HWADDR_FMT_plx ", size %" PRIu64,
++    //             bar2, memory_region_size(s->ivshmem_bar2));
+     switch (addr)
+     {
+         case INTRMASK:
+@@ -812,6 +823,26 @@ static void ivshmem_disable_irqfd(IVShmemState *s)
+ 
+ }
+ 
++
++static int kvm_set_prot_gpa_range(hwaddr start, hwaddr size) //like mprotect
++{
++    struct kvm_gpa_range attrs;
++    int r;
++
++    attrs.start = start;
++    attrs.size = size;
++
++    //PRINT HERE - GPA, USER ADDR, SIZE
++    warn_report("kvm_set_prot_gpa_range: addr=0x%" HWADDR_PRIx ", size=0x%" PRIx64,
++                start, size);
++
++    r = kvm_vm_ioctl(kvm_state, KVM_SET_PROT_GPA_RANGE, &attrs);
++    if (r) {
++        error_report("KVM_SET_PROT_GPA_RANGE failed: %s", strerror(errno));
++    }
++    return r;
++}
++
+ static void ivshmem_write_config(PCIDevice *pdev, uint32_t address,
+                                  uint32_t val, int len)
+ {
+@@ -828,6 +859,27 @@ static void ivshmem_write_config(PCIDevice *pdev, uint32_t address,
+             ivshmem_disable_irqfd(s);
+         }
+     }
++    /* If BAR2 (64-bit) or COMMAND gets written, try to apply WO. */
++    /* BAR2 low dword:  0x18, BAR2 high dword: 0x1C */
++    bool bar2_written =
++        ranges_overlap(address, len, PCI_BASE_ADDRESS_2, 4) ||
++        ranges_overlap(address, len, PCI_BASE_ADDRESS_3, 4);
++    bool cmd_written = ranges_overlap(address, len, PCI_COMMAND, 2);
++
++    if (bar2_written || cmd_written) {
++        pcibus_t bar2 = pci_get_bar_addr(PCI_DEVICE(s), 2);
++        hwaddr start = bar2;
++        hwaddr size = memory_region_size(s->ivshmem_bar2);
++        warn_report("BAR2 GPA=0x" HWADDR_FMT_plx " size=0x" HWADDR_FMT_plx "\n",
++                    start, size);
++        Error *err = NULL;
++        if (kvm_set_prot_gpa_range(start, size)) {
++            /* Didn’t succeed: warn and keep trying only once to avoid spam */
++            s->prot_applied = true;  /* avoid loops; if you want retries, drop this */
++            return;
++        }
++        
++    }
+ }
+ 
+ static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
+@@ -858,6 +910,7 @@ static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
+         IVSHMEM_DPRINTF("using hostmem\n");
+ 
+         s->ivshmem_bar2 = host_memory_backend_get_memory(s->hostmem);
++
+         host_memory_backend_set_mapped(s->hostmem, true);
+     } else {
+         Chardev *chr = qemu_chr_fe_get_driver(&s->server_chr);
+@@ -1026,6 +1079,7 @@ static const Property ivshmem_plain_properties[] = {
+     DEFINE_PROP_ON_OFF_AUTO("master", IVShmemState, master, ON_OFF_AUTO_OFF),
+     DEFINE_PROP_LINK("memdev", IVShmemState, hostmem, TYPE_MEMORY_BACKEND,
+                      HostMemoryBackend *),
++    DEFINE_PROP_BOOL("protected", IVShmemState, protected, false),
+ };
+ 
+ static void ivshmem_plain_realize(PCIDevice *dev, Error **errp)
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index 9b4bf48439..2797377630 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -1483,6 +1483,9 @@ void pci_register_bar(PCIDevice *pci_dev, int region_num,
+     r->address_space = type & PCI_BASE_ADDRESS_SPACE_IO
+                         ? pci_get_bus(pci_dev)->address_space_io
+                         : pci_get_bus(pci_dev)->address_space_mem;
++    
++    warn_report("pci_register_bar: dev=%s region_num=%d type=%x size=0x%" PRIx64 "\n",
++                pci_dev->name, region_num, type, size);
+ 
+     if (pci_is_vf(pci_dev)) {
+         PCIDevice *pf = pci_dev->exp.sriov_vf.pf;
+diff --git a/linux-headers/asm-arm64/kvm.h b/linux-headers/asm-arm64/kvm.h
+index 91ab0f2763..314e7dd1e5 100644
+--- a/linux-headers/asm-arm64/kvm.h
++++ b/linux-headers/asm-arm64/kvm.h
+@@ -424,6 +424,8 @@ enum {
+ #define KVM_CAP_ARM_RME_INIT_RIPAS_REALM	2
+ #define KVM_CAP_ARM_RME_POPULATE_REALM		3
+ #define KVM_CAP_ARM_RME_ACTIVATE_REALM		4
++#define KVM_CAP_ARM_RME_CUSTOM_PRINT        5
++
+ 
+ /* List of configuration items accepted for KVM_CAP_ARM_RME_CONFIG_REALM */
+ #define ARM_RME_CONFIG_RPV			0
+diff --git a/linux-headers/linux/kvm.h b/linux-headers/linux/kvm.h
+index 03484644e1..32c7e56b07 100644
+--- a/linux-headers/linux/kvm.h
++++ b/linux-headers/linux/kvm.h
+@@ -1599,4 +1599,11 @@ struct kvm_arm_rmm_psci_complete {
+ 
+ #define KVM_ARM_VCPU_RMM_PSCI_COMPLETE	_IOW(KVMIO, 0xd6, struct kvm_arm_rmm_psci_complete)
+ 
++#define KVM_SET_PROT_GPA_RANGE   _IOW(KVMIO, 0xd7, struct kvm_gpa_range)
++
++struct kvm_gpa_range {
++        __u64 start;   /* GPA, must be page aligned */
++        __u64 size;      /* bytes, page aligned, > 0 */
++};
++
+ #endif /* __LINUX_KVM_H */
+diff --git a/system/memory.c b/system/memory.c
+index 76b44b8220..df049450de 100644
+--- a/system/memory.c
++++ b/system/memory.c
+@@ -1673,6 +1673,8 @@ bool memory_region_init_ram_from_fd(MemoryRegion *mr,
+     mr->destructor = memory_region_destructor_ram;
+     mr->ram_block = qemu_ram_alloc_from_fd(size, size, NULL, mr, ram_flags, fd,
+                                            offset, false, &err);
++
++
+     if (err) {
+         mr->size = int128_zero();
+         object_unparent(OBJECT(mr));
+diff --git a/system/physmem.c b/system/physmem.c
+index 1f1217fa0a..671664cc22 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -2024,6 +2024,12 @@ RAMBlock *qemu_ram_alloc_from_fd(ram_addr_t size, ram_addr_t max_size,
+     Error *local_err = NULL;
+     int64_t file_size, file_align, share_flags;
+ 
++    warn_report("qemu_ram_alloc_from_fd: size=0x" RAM_ADDR_FMT
++                " max_size=0x" RAM_ADDR_FMT
++                " offset=0x%" PRIx64
++                " flags=0x%x fd=%d \n",
++                size, max_size, (uint64_t)offset, ram_flags, fd);
++
+     share_flags = ram_flags & (RAM_PRIVATE | RAM_SHARED);
+     assert(share_flags != (RAM_SHARED | RAM_PRIVATE));
+     ram_flags &= ~RAM_PRIVATE;
+diff --git a/target/arm/kvm-rme.c b/target/arm/kvm-rme.c
+index 6159150a26..bf8f0565a4 100644
+--- a/target/arm/kvm-rme.c
++++ b/target/arm/kvm-rme.c
+@@ -584,6 +584,13 @@ static int rme_create_realm(Error **errp)
+     }
+ 
+     g_slist_foreach(rme_guest->ram_regions, rme_populate_ram_region, errp);
++
++    for (GSList *p = rme_guest->ram_regions; p; p = p->next) {
++        const RmeRamRegion *r = p->data;
++        warn_report("RME RAM: [0x%016" HWADDR_PRIx ", 0x%016" HWADDR_PRIx ")\n",
++                r->base, r->base + r->size);
++    }
++    
+     g_slist_free_full(g_steal_pointer(&rme_guest->ram_regions), g_free);
+     if (*errp) {
+         return -1;
+@@ -604,6 +611,9 @@ static int rme_create_realm(Error **errp)
+         return -1;
+     }
+ 
++    ret = kvm_vm_enable_cap(kvm_state, KVM_CAP_ARM_RME, 0,
++                            KVM_CAP_ARM_RME_CUSTOM_PRINT);
++
+     kvm_mark_guest_state_protected();
+     return 0;
+ }
+diff --git a/target/arm/kvm_arm.h b/target/arm/kvm_arm.h
+index 0a58132468..7615322a87 100644
+--- a/target/arm/kvm_arm.h
++++ b/target/arm/kvm_arm.h
+@@ -288,4 +288,6 @@ void kvm_arm_rme_init_gpa_space(hwaddr highest_gpa, PCIBus *pci_bus);
+  */
+ Object *kvm_arm_rme_get_measurement_log(void);
+ 
++int kvm_arm_rme_set_prot_range(hwaddr ipa, hwaddr size, Error **errp);
++
+ #endif
+diff --git a/util/mmap-alloc.c b/util/mmap-alloc.c
+index ed14f9c64d..17e5b93a87 100644
+--- a/util/mmap-alloc.c
++++ b/util/mmap-alloc.c
+@@ -254,6 +254,9 @@ void *qemu_ram_mmap(int fd,
+     size_t offset, total;
+     void *ptr, *guardptr;
+ 
++    warn_report("qemu_ram_mmap: fd=%d, size=0x%zx, align=0x%zx, ",
++                fd, size, align);  
++
+     /*
+      * Note: this always allocates at least one extra page of virtual address
+      * space, even if size is already aligned.
+@@ -289,7 +292,7 @@ void *qemu_ram_mmap(int fd,
+     total -= offset;
+     if (total > size + guard_pagesize) {
+         munmap(ptr + size + guard_pagesize, total - size - guard_pagesize);
+-    }
++    }  
+ 
+     return ptr;
+ }

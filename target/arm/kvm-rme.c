@@ -80,6 +80,7 @@ struct RmeGuest {
     uint8_t personalization_value[ARM_RME_CONFIG_RPV_SIZE];
     RmeGuestMeasurementAlgorithm measurement_algo;
     bool use_measurement_log;
+    // bool use_shmem_prot;
 
     RmeRamRegion init_ram;
     uint8_t ipa_bits;
@@ -584,6 +585,13 @@ static int rme_create_realm(Error **errp)
     }
 
     g_slist_foreach(rme_guest->ram_regions, rme_populate_ram_region, errp);
+
+    for (GSList *p = rme_guest->ram_regions; p; p = p->next) {
+        const RmeRamRegion *r = p->data;
+        warn_report("RME RAM: [0x%016" HWADDR_PRIx ", 0x%016" HWADDR_PRIx ")\n",
+                r->base, r->base + r->size);
+    }
+    
     g_slist_free_full(g_steal_pointer(&rme_guest->ram_regions), g_free);
     if (*errp) {
         return -1;
@@ -603,6 +611,9 @@ static int rme_create_realm(Error **errp)
         error_setg_errno(errp, -ret, "failed to activate realm");
         return -1;
     }
+
+    ret = kvm_vm_enable_cap(kvm_state, KVM_CAP_ARM_RME, 0,
+                            KVM_CAP_ARM_RME_CUSTOM_PRINT);
 
     kvm_mark_guest_state_protected();
     return 0;
@@ -680,6 +691,20 @@ static void rme_set_measurement_log(Object *obj, bool value, Error **errp)
     guest->use_measurement_log = value;
 }
 
+// static bool rme_get_shmem_prot(Object *obj, Error **errp)
+// {
+//     RmeGuest *guest = RME_GUEST(obj);
+
+//     return guest->use_shmem_prot;
+// }
+
+// static void rme_set_shmem_prot(Object *obj, bool value, Error **errp)
+// {
+//     RmeGuest *guest = RME_GUEST(obj);
+
+//     guest->use_shmem_prot = value;
+// }
+
 static void rme_guest_class_init(ObjectClass *oc, const void *data)
 {
     object_class_property_add_str(oc, "personalization-value", rme_get_rpv,
@@ -700,6 +725,11 @@ static void rme_guest_class_init(ObjectClass *oc, const void *data)
                                    rme_set_measurement_log);
     object_class_property_set_description(oc, "measurement-log",
             "Enable/disable Realm measurement log");
+    // object_class_property_add_bool(oc, "shmem-prot",
+    //                                rme_get_shmem_prot,
+    //                                rme_set_shmem_prot);
+    // object_class_property_set_description(oc, "shmem-prot",
+    //         "Enable/disable protected shared memory");
 }
 
 static void rme_guest_init(Object *obj)

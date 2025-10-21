@@ -288,4 +288,6 @@ void kvm_arm_rme_init_gpa_space(hwaddr highest_gpa, PCIBus *pci_bus);
  */
 Object *kvm_arm_rme_get_measurement_log(void);
 
+int kvm_arm_rme_set_prot_range(hwaddr ipa, hwaddr size, Error **errp);
+
 #endif

@@ -252,7 +252,7 @@ void *qemu_ram_mmap(int fd,
 {
     const size_t guard_pagesize = mmap_guard_pagesize(fd);
     size_t offset, total;
-    void *ptr, *guardptr;
+    void *ptr, *guardptr; 
 
     /*
      * Note: this always allocates at least one extra page of virtual address
@@ -289,7 +289,10 @@ void *qemu_ram_mmap(int fd,
     total -= offset;
     if (total > size + guard_pagesize) {
         munmap(ptr + size + guard_pagesize, total - size - guard_pagesize);
-    }
+    }  
+
+    warn_report("qemu_ram_mmap: fd=%d, size=0x%zx, align=0x%zx, ptr=%p",
+            fd, size, align, ptr);
 
     return ptr;
 }

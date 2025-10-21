@@ -1673,6 +1673,8 @@ bool memory_region_init_ram_from_fd(MemoryRegion *mr,
     mr->destructor = memory_region_destructor_ram;
     mr->ram_block = qemu_ram_alloc_from_fd(size, size, NULL, mr, ram_flags, fd,
                                            offset, false, &err);
+
+
     if (err) {
         mr->size = int128_zero();
         object_unparent(OBJECT(mr));

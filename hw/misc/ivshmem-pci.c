@@ -40,6 +40,7 @@
 #include "hw/misc/ivshmem.h"
 #include "qom/object.h"
 
+
 #define PCI_VENDOR_ID_IVSHMEM   PCI_VENDOR_ID_REDHAT_QUMRANET
 #define PCI_DEVICE_ID_IVSHMEM   0x1110
 
@@ -117,6 +118,9 @@ struct IVShmemState {
     /* migration stuff */
     OnOffAuto master;
     Error *migration_blocker;
+
+    /*protected*/
+    bool protected;
 };
 
 /* registers for the Inter-VM shared memory device */
@@ -126,6 +130,80 @@ enum ivshmem_registers {
     IVPOSITION = 8,
     DOORBELL = 12,
 };
+
+/* Resolve through alias layers to the original target region */
+static inline MemoryRegion *mr_resolve_alias(MemoryRegion *mr) {
+    while (mr && mr->alias) {
+        mr = mr->alias;
+    }
+    return mr;
+}
+
+/* Opaque used while walking the QOM tree */
+typedef struct FindByBar2Target {
+    MemoryRegion *target;     /* resolved alias target we’re looking for (e.g., shm1) */
+    DeviceState  *dev;        /* matched PCI device, if any */
+    MemoryRegion *bar2;       /* its BAR2 MR */
+} FindByBar2Target;
+
+static int match_pci_bar2_cb(Object *obj, void *opaque)
+{
+    FindByBar2Target *st = opaque;
+
+    if (!object_dynamic_cast(obj, TYPE_PCI_DEVICE)) {
+        return 0; /* keep walking */
+    }
+
+    PCIDevice *pdev = PCI_DEVICE(obj);
+    MemoryRegion *bar2 = pdev->io_regions[2].memory;
+    if (!bar2) {
+        return 0;
+    }
+
+    MemoryRegion *bar2_target = mr_resolve_alias(bar2);
+    if (bar2_target == st->target) {
+        st->dev  = DEVICE(obj);
+        st->bar2 = bar2;
+        return 1; /* non-zero => stop walking */
+    }
+
+    return 0; /* no match; continue */
+}
+
+/* Returns true iff `any_mr` ultimately backs ivshmem’s BAR2 and ivshmem->protected is true. */
+bool ivshmem_bar2_is_protected(MemoryRegion *any_mr)
+{
+    if (!any_mr) return false;
+
+    /* 1) Normalize the candidate MR to its backend/real target (e.g., memory-backend-file MR) */
+    MemoryRegion *want = mr_resolve_alias(any_mr);
+
+    /* 2) Walk the machine’s QOM tree, find a PCI device whose BAR2 resolves to `want` */
+    FindByBar2Target st = { .target = want, .dev = NULL, .bar2 = NULL };
+    Object *root = OBJECT(qdev_get_machine());
+    object_child_foreach_recursive(root, match_pci_bar2_cb, &st);
+
+    if (!st.dev) {
+        /* No PCI device has BAR2 aliased to this MR */
+        return false;
+    }
+
+    warn_report("matched device %s BAR2->target=%s",
+            object_get_typename(OBJECT(st.dev)),
+            memory_region_name(mr_resolve_alias(PCI_DEVICE(st.dev)->io_regions[2].memory)));
+
+    /* 3) Confirm the device is an ivshmem variant and return the flag */
+    IVShmemState *s = NULL;
+    if (object_dynamic_cast(OBJECT(st.dev), TYPE_IVSHMEM_PLAIN)) {
+        s = IVSHMEM_PLAIN(OBJECT(st.dev));
+    } else if (object_dynamic_cast(OBJECT(st.dev), TYPE_IVSHMEM_DOORBELL)) {
+        s = IVSHMEM_DOORBELL(OBJECT(st.dev));
+    } else {
+        return false; /* matched BAR2, but not an ivshmem device */
+    }
+
+    return s->protected;  /* legal here inside ivshmem-pci.c */
+}
 
 static inline uint32_t ivshmem_has_feature(IVShmemState *ivs,
                                                     unsigned int feature) {
@@ -180,6 +258,11 @@ static void ivshmem_io_write(void *opaque, hwaddr addr,
     addr &= 0xfc;
 
     IVSHMEM_DPRINTF("writing to addr " HWADDR_FMT_plx "\n", addr);
+
+    // hwaddr bar2 = pci_get_bar_addr(PCI_DEVICE(s), 2);
+
+    // warn_report("bar 2 at " HWADDR_FMT_plx ", size %" PRIu64,
+    //             bar2, memory_region_size(s->ivshmem_bar2));
     switch (addr)
     {
         case INTRMASK:
@@ -214,7 +297,6 @@ static void ivshmem_io_write(void *opaque, hwaddr addr,
 static uint64_t ivshmem_io_read(void *opaque, hwaddr addr,
                                 unsigned size)
 {
-
     IVShmemState *s = opaque;
     uint32_t ret;
 
@@ -812,15 +894,67 @@ static void ivshmem_disable_irqfd(IVShmemState *s)
 
 }
 
+/* Put this somewhere near your device code */
+// #define FIXED_GPA  (0x0000000050000000ULL)
+
+// /* tiny helper: does a cfg write [address, address+len) touch [off, off+sz)? */
+// static inline bool overlaps(unsigned address, int len, unsigned off, unsigned sz)
+// {
+//     unsigned a0 = address, a1 = address + len;
+//     unsigned b0 = off,     b1 = off + sz;
+//     return !(a1 <= b0 || b1 <= a0);
+// }
+
 static void ivshmem_write_config(PCIDevice *pdev, uint32_t address,
                                  uint32_t val, int len)
 {
     IVShmemState *s = IVSHMEM_COMMON(pdev);
-    int is_enabled, was_enabled = msix_enabled(pdev);
+    int was_enabled = msix_enabled(pdev);
 
+    // /* ---- Intercept BAR2 writes and force a GPA via default handler ---- */
+    // const int bar_index = 2;                       /* ivshmem data BAR */
+    // const unsigned off = pci_bar(pdev, bar_index); /* cfg-space offset of BAR2 */
+    // PCIIORegion *r = &pdev->io_regions[bar_index];
+
+    // /* Only care if this write hits BAR2 (low or high dword). */
+    // if(s->protected) {
+    //     if (r->size && overlaps(address, len, off, 4)) {
+    //         /* low dword write */
+    //         /* If this is a sizing write (all 1s), pass through unchanged. */
+    //         if (!(len == 4 && val == 0xFFFFFFFFu)) {
+    //             if (r->type & PCI_BASE_ADDRESS_SPACE_IO) {
+    //                 /* (unlikely for ivshmem data window) */
+    //                 uint32_t forced = (r->type & ~PCI_BASE_ADDRESS_IO_MASK) |
+    //                                 (uint32_t)(FIXED_GPA & PCI_BASE_ADDRESS_IO_MASK);
+    //                 val = forced;
+    //             } else {
+    //                 /* memory BAR */
+    //                 uint64_t mask = ~((uint64_t)r->size - 1) & PCI_BASE_ADDRESS_MEM_MASK;
+    //                 uint32_t forced_low =
+    //                     (r->type & ~PCI_BASE_ADDRESS_MEM_MASK) |
+    //                     (uint32_t)((FIXED_GPA & mask) & 0xFFFFFFFFu);
+    //                 val = forced_low;
+    //             }
+    //         }
+    //         pci_default_write_config(pdev, address, val, len);
+    //     } else if (r->size && (r->type & PCI_BASE_ADDRESS_MEM_TYPE_64) &&
+    //             overlaps(address, len, off + 4, 4)) {
+    //         /* high dword write of a 64-bit BAR */
+    //         if (!(len == 4 && val == 0xFFFFFFFFu)) {
+    //             uint64_t mask = ~((uint64_t)r->size - 1) & PCI_BASE_ADDRESS_MEM_MASK;
+    //             uint32_t forced_high = (uint32_t)(((FIXED_GPA & mask) >> 32) & 0xFFFFFFFFu);
+    //             val = forced_high;
+    //         }
+    //         pci_default_write_config(pdev, address, val, len);
+    //     } 
+    // }
+    // else {
+        /* Not BAR2: normal handling. This still covers ROM BAR, command, MSI-X, etc. */
     pci_default_write_config(pdev, address, val, len);
-    is_enabled = msix_enabled(pdev);
+    // }
 
+    /* ---- ivshmem-specific MSI-X irqfd toggling (unchanged) ---- */
+    int is_enabled = msix_enabled(pdev);
     if (kvm_msi_via_irqfd_enabled()) {
         if (!was_enabled && is_enabled) {
             ivshmem_enable_irqfd(s);
@@ -829,6 +963,7 @@ static void ivshmem_write_config(PCIDevice *pdev, uint32_t address,
         }
     }
 }
+
 
 static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
 {
@@ -858,6 +993,7 @@ static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
         IVSHMEM_DPRINTF("using hostmem\n");
 
         s->ivshmem_bar2 = host_memory_backend_get_memory(s->hostmem);
+
         host_memory_backend_set_mapped(s->hostmem, true);
     } else {
         Chardev *chr = qemu_chr_fe_get_driver(&s->server_chr);
@@ -1026,6 +1162,7 @@ static const Property ivshmem_plain_properties[] = {
     DEFINE_PROP_ON_OFF_AUTO("master", IVShmemState, master, ON_OFF_AUTO_OFF),
     DEFINE_PROP_LINK("memdev", IVShmemState, hostmem, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
+    DEFINE_PROP_BOOL("protected", IVShmemState, protected, false),
 };
 
 static void ivshmem_plain_realize(PCIDevice *dev, Error **errp)

@@ -2024,6 +2024,12 @@ RAMBlock *qemu_ram_alloc_from_fd(ram_addr_t size, ram_addr_t max_size,
     Error *local_err = NULL;
     int64_t file_size, file_align, share_flags;
 
+    warn_report("qemu_ram_alloc_from_fd: size=0x" RAM_ADDR_FMT
+                " max_size=0x" RAM_ADDR_FMT
+                " offset=0x%" PRIx64
+                " flags=0x%x fd=%d \n",
+                size, max_size, (uint64_t)offset, ram_flags, fd);
+
     share_flags = ram_flags & (RAM_PRIVATE | RAM_SHARED);
     assert(share_flags != (RAM_SHARED | RAM_PRIVATE));
     ram_flags &= ~RAM_PRIVATE;

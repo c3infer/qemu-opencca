@@ -53,6 +53,8 @@
 #include "hw/boards.h"
 #include "system/stats.h"
 
+#include "hw/misc/ivshmem-pci.h" //to add
+
 /* This check must be after config-host.h is included */
 #ifdef CONFIG_EVENTFD
 #include <sys/eventfd.h>
@@ -354,7 +356,7 @@ int kvm_physical_memory_addr_from_host(KVMState *s, void *ram,
     return ret;
 }
 
-static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, bool new)
+static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, bool new) //like mmap
 {
     KVMState *s = kvm_state;
     struct kvm_userspace_memory_region2 mem;
@@ -373,28 +375,60 @@ static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, boo
         mem.memory_size = 0;
 
         if (kvm_guest_memfd_supported) {
+            warn_report("kvm_set_user_memory_region2: guest_phys_addr=0x%" PRIx64
+                " userspace_addr=0x%lx size=0x%" PRIx64,
+                mem.guest_phys_addr, mem.userspace_addr,
+                (uint64_t)slot->memory_size);
             ret = kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION2, &mem);
         } else {
+            warn_report("kvm_set_user_memory_region: guest_phys_addr=0x%" PRIx64
+                " userspace_addr=0x%lx size=0x%" PRIx64,
+                mem.guest_phys_addr, mem.userspace_addr,
+                (uint64_t)slot->memory_size);
             ret = kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION, &mem);
         }
         if (ret < 0) {
+            // warn_report("kvm_set_user_memory_region: failed for: guest_phys_addr=0x%" PRIx64
+            //     " userspace_addr=0x%lx size=0x%" PRIx64,
+            //     mem.guest_phys_addr, mem.userspace_addr,
+            //     (uint64_t)slot->memory_size);
             goto err;
         }
     }
     mem.memory_size = slot->memory_size;
     if (kvm_guest_memfd_supported) {
+        warn_report("kvm_set_user_memory_region2: guest_phys_addr=0x%" PRIx64
+                " userspace_addr=0x%lx size=0x%" PRIx64,
+                mem.guest_phys_addr, mem.userspace_addr,
+                (uint64_t)slot->memory_size);
         ret = kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION2, &mem);
     } else {
+        warn_report("kvm_set_user_memory_region: guest_phys_addr=0x%" PRIx64
+                " userspace_addr=0x%lx size=0x%" PRIx64,
+                mem.guest_phys_addr, mem.userspace_addr,
+                (uint64_t)slot->memory_size);
         ret = kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION, &mem);
     }
     slot->old_flags = mem.flags;
 err:
+    // warn_report("kvm_set_user_memory_region: failed for: guest_phys_addr=0x%" PRIx64
+    //             " userspace_addr=0x%lx size=0x%" PRIx64,
+    //             mem.guest_phys_addr, mem.userspace_addr,
+    //             (uint64_t)slot->memory_size);
     trace_kvm_set_user_memory(mem.slot >> 16, (uint16_t)mem.slot, mem.flags,
                               mem.guest_phys_addr, mem.memory_size,
                               mem.userspace_addr, mem.guest_memfd,
                               mem.guest_memfd_offset, ret);
     if (ret < 0) {
         if (kvm_guest_memfd_supported) {
+                warn_report("%s: KVM_SET_USER_MEMORY_REGION2 failed, slot=%d,"
+                        " start=0x%" PRIx64 ", size=0x%" PRIx64 ","
+                        " flags=0x%" PRIx32 ", guest_memfd=%" PRId32 ","
+                        " guest_memfd_offset=0x%" PRIx64 ": %s",
+                        __func__, mem.slot, slot->start_addr,
+                        (uint64_t)mem.memory_size, mem.flags,
+                        mem.guest_memfd, (uint64_t)mem.guest_memfd_offset,
+                        strerror(errno));
                 error_report("%s: KVM_SET_USER_MEMORY_REGION2 failed, slot=%d,"
                         " start=0x%" PRIx64 ", size=0x%" PRIx64 ","
                         " flags=0x%" PRIx32 ", guest_memfd=%" PRId32 ","
@@ -404,6 +438,10 @@ err:
                         mem.guest_memfd, (uint64_t)mem.guest_memfd_offset,
                         strerror(errno));
         } else {
+                warn_report("%s: KVM_SET_USER_MEMORY_REGION failed, slot=%d,"
+                            " start=0x%" PRIx64 ", size=0x%" PRIx64 ": %s",
+                            __func__, mem.slot, slot->start_addr,
+                            (uint64_t)mem.memory_size, strerror(errno));
                 error_report("%s: KVM_SET_USER_MEMORY_REGION failed, slot=%d,"
                             " start=0x%" PRIx64 ", size=0x%" PRIx64 ": %s",
                             __func__, mem.slot, slot->start_addr,
@@ -1429,7 +1467,7 @@ void kvm_set_max_memslot_size(hwaddr max_slot_size)
     kvm_max_slot_size = max_slot_size;
 }
 
-static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr)
+static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr) //like mprotect
 {
     struct kvm_memory_attributes attrs;
     int r;
@@ -1440,13 +1478,28 @@ static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr)
     attrs.size = size;
     attrs.flags = 0;
 
+    //PRINT HERE - GPA, USER ADDR, SIZE
+    warn_report("kvm_set_memory_attributes: addr=0x%" HWADDR_PRIx ", size=0x%" PRIx64 ", attr=0x%" PRIx64,
+                start, size, attr);
+
     r = kvm_vm_ioctl(kvm_state, KVM_SET_MEMORY_ATTRIBUTES, &attrs);
     if (r) {
+        warn_report("kvm_set_memory_attributes: KVM_SET_MEMORY_ATTRIBUTES failed");
         error_report("failed to set memory (0x%" HWADDR_PRIx "+0x%" PRIx64 ") "
                      "with attr 0x%" PRIx64 " error '%s'",
                      start, size, attr, strerror(errno));
     }
     return r;
+}
+
+// int kvm_set_memory_attributes_private_shared_committed(hwaddr start, uint64_t size)
+// {
+//     return kvm_set_memory_attributes(start, size, KVM_MEMORY_ATTRIBUTE_PRIVATE_SHARED_COMMITTED);
+// }
+
+int kvm_set_memory_attributes_private_shared(hwaddr start, uint64_t size)
+{
+    return kvm_set_memory_attributes(start, size, KVM_MEMORY_ATTRIBUTE_PRIVATE_SHARED);
 }
 
 int kvm_set_memory_attributes_private(hwaddr start, uint64_t size)
@@ -3079,7 +3132,22 @@ int kvm_convert_memory(hwaddr start, hwaddr size, bool to_private)
         goto out_unref;
     }
 
-    if (to_private) {
+    bool to_private_shared = false;
+    warn_report("Checking if protected_shared");
+    if (ivshmem_bar2_is_protected(mr)) {
+        uint8_t *base = NULL;
+        if (memory_region_is_ram(mr) && !memory_region_is_ram_device(mr)) {
+            base = memory_region_get_ram_ptr(mr);
+            // add your offset within the region if needed
+        }
+        warn_report("FAULT for ivshmem at GPA, SIZE (0x%"HWADDR_PRIx" ,+ 0x%"HWADDR_PRIx") with user_address +0x%"HWADDR_PRIx" to protected_shared is not allowed ",
+                     start, size, base);
+        to_private_shared = true;
+    }
+
+    if (to_private_shared) {
+        ret = kvm_set_memory_attributes_private_shared(start, size);
+    } else if (to_private) {
         ret = kvm_set_memory_attributes_private(start, size);
     } else {
         ret = kvm_set_memory_attributes_shared(start, size);
@@ -3287,6 +3355,11 @@ int kvm_cpu_exec(CPUState *cpu)
             }
             break;
         case KVM_EXIT_MEMORY_FAULT:
+            warn_report("Memory region at GPA 0x%llx size 0x%" PRIx64
+                    " converted to %s",
+                    (unsigned long long)run->memory_fault.gpa, run->memory_fault.size,
+                    (run->memory_fault.flags & KVM_MEMORY_EXIT_FLAG_PRIVATE) ?
+                    "private" : "shared"); 
             trace_kvm_memory_fault(run->memory_fault.gpa,
                                    run->memory_fault.size,
                                    run->memory_fault.flags);

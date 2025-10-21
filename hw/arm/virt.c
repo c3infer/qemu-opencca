@@ -1592,12 +1592,12 @@ static void create_pcie(VirtMachineState *vms)
      * (ie 1:1 mapping for that part of PCI MMIO space visible through
      * the window).
      */
-    mmio_alias = g_new0(MemoryRegion, 1);
+    
     mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
+    mmio_alias = g_new0(MemoryRegion, 1);
     memory_region_init_alias(mmio_alias, OBJECT(dev), "pcie-mmio",
-                             mmio_reg, base_mmio, size_mmio);
+                            mmio_reg, base_mmio, size_mmio);
     memory_region_add_subregion(get_system_memory(), base_mmio, mmio_alias);
-
     if (vms->highmem_mmio) {
         /* Map high MMIO space */
         MemoryRegion *high_mmio_alias = g_new0(MemoryRegion, 1);
@@ -1740,6 +1740,136 @@ static void create_secure_ram(VirtMachineState *vms,
     }
 
     g_free(nodename);
+}
+
+static void create_secure_pcie(VirtMachineState *vms,
+                              MemoryRegion *secure_sysmem)
+{
+    hwaddr base_mmio = vms->memmap[VIRT_PCIE_MMIO].base;
+    hwaddr size_mmio = vms->memmap[VIRT_PCIE_MMIO].size;
+    hwaddr base_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].base;
+    hwaddr size_mmio_high = vms->memmap[VIRT_HIGH_PCIE_MMIO].size;
+    hwaddr base_pio = vms->memmap[VIRT_PCIE_PIO].base;
+    hwaddr size_pio = vms->memmap[VIRT_PCIE_PIO].size;
+    hwaddr base_ecam, size_ecam;
+    hwaddr base = base_mmio;
+    int nr_pcie_buses;
+    int irq = vms->irqmap[VIRT_PCIE];
+    MemoryRegion *mmio_alias;
+    MemoryRegion *mmio_reg;
+    MemoryRegion *ecam_alias;
+    MemoryRegion *ecam_reg;
+    DeviceState *dev;
+    char *nodename;
+    int i, ecam_id;
+    PCIHostState *pci;
+    MachineState *ms = MACHINE(vms);
+    MachineClass *mc = MACHINE_GET_CLASS(ms);
+
+    dev = qdev_new(TYPE_GPEX_HOST);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+
+    ecam_id = VIRT_ECAM_ID(vms->highmem_ecam);
+    base_ecam = vms->memmap[ecam_id].base;
+    size_ecam = vms->memmap[ecam_id].size;
+    nr_pcie_buses = size_ecam / PCIE_MMCFG_SIZE_MIN;
+    /* Map only the first size_ecam bytes of ECAM space */
+    ecam_alias = g_new0(MemoryRegion, 1);
+    ecam_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+    memory_region_init_alias(ecam_alias, OBJECT(dev), "pcie-ecam",
+                             ecam_reg, 0, size_ecam);
+    memory_region_add_subregion(get_system_memory(), base_ecam, ecam_alias);
+
+    /* Map the MMIO window into system address space so as to expose
+     * the section of PCI MMIO space which starts at the same base address
+     * (ie 1:1 mapping for that part of PCI MMIO space visible through
+     * the window).
+     */
+    
+    mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
+    mmio_alias = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(mmio_alias, OBJECT(dev), "pcie-mmio",
+                            mmio_reg, base_mmio, size_mmio);
+    memory_region_add_subregion(secure_sysmem, base_mmio, mmio_alias);
+    if (vms->highmem_mmio) {
+        /* Map high MMIO space */
+        MemoryRegion *high_mmio_alias = g_new0(MemoryRegion, 1);
+
+        memory_region_init_alias(high_mmio_alias, OBJECT(dev), "pcie-mmio-high",
+                                 mmio_reg, base_mmio_high, size_mmio_high);
+        memory_region_add_subregion(get_system_memory(), base_mmio_high,
+                                    high_mmio_alias);
+    }
+
+    /* Map IO port space */
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, base_pio);
+
+    for (i = 0; i < PCI_NUM_PINS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           qdev_get_gpio_in(vms->gic, irq + i));
+        gpex_set_irq_num(GPEX_HOST(dev), i, irq + i);
+    }
+
+    pci = PCI_HOST_BRIDGE(dev);
+    pci->bypass_iommu = vms->default_bus_bypass_iommu;
+    vms->bus = pci->bus;
+    if (vms->bus) {
+        pci_init_nic_devices(pci->bus, mc->default_nic);
+    }
+
+    nodename = vms->pciehb_nodename = g_strdup_printf("/pcie@%" PRIx64, base);
+    qemu_fdt_add_subnode(ms->fdt, nodename);
+    qemu_fdt_setprop_string(ms->fdt, nodename,
+                            "compatible", "pci-host-ecam-generic");
+    qemu_fdt_setprop_string(ms->fdt, nodename, "device_type", "pci");
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "#address-cells", 3);
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "#size-cells", 2);
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "linux,pci-domain", 0);
+    qemu_fdt_setprop_cells(ms->fdt, nodename, "bus-range", 0,
+                           nr_pcie_buses - 1);
+    qemu_fdt_setprop(ms->fdt, nodename, "dma-coherent", NULL, 0);
+
+    if (vms->msi_phandle) {
+        qemu_fdt_setprop_cells(ms->fdt, nodename, "msi-map",
+                               0, vms->msi_phandle, 0, 0x10000);
+    }
+
+    qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
+                                 2, base_ecam, 2, size_ecam);
+
+    if (vms->highmem_mmio) {
+        qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "ranges",
+                                     1, FDT_PCI_RANGE_IOPORT, 2, 0,
+                                     2, base_pio, 2, size_pio,
+                                     1, FDT_PCI_RANGE_MMIO, 2, base_mmio,
+                                     2, base_mmio, 2, size_mmio,
+                                     1, FDT_PCI_RANGE_MMIO_64BIT,
+                                     2, base_mmio_high,
+                                     2, base_mmio_high, 2, size_mmio_high);
+    } else {
+        qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "ranges",
+                                     1, FDT_PCI_RANGE_IOPORT, 2, 0,
+                                     2, base_pio, 2, size_pio,
+                                     1, FDT_PCI_RANGE_MMIO, 2, base_mmio,
+                                     2, base_mmio, 2, size_mmio);
+    }
+
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "#interrupt-cells", 1);
+    create_pcie_irq_map(ms, vms->gic_phandle, irq, nodename);
+
+    if (vms->iommu) {
+        vms->iommu_phandle = qemu_fdt_alloc_phandle(ms->fdt);
+
+        switch (vms->iommu) {
+        case VIRT_IOMMU_SMMUV3:
+            create_smmu(vms, vms->bus);
+            qemu_fdt_setprop_cells(ms->fdt, nodename, "iommu-map",
+                                   0x0, vms->iommu_phandle, 0x0, 0x10000);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
 }
 
 static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
@@ -2475,7 +2605,13 @@ static void machvirt_init(MachineState *machine)
 
     create_rtc(vms);
 
+    // if(vms->secure) {
+    //     warn_report("Setting up secure PCIe bus");
+    //     create_secure_pcie(vms, secure_sysmem);
+    // } else {
     create_pcie(vms);
+    // }
+    
 
     if (has_ged && aarch64 && firmware_loaded && virt_is_acpi_enabled(vms)) {
         vms->acpi_dev = create_acpi_ged(vms);
@@ -2517,6 +2653,11 @@ static void machvirt_init(MachineState *machine)
     kvm_arm_rme_init_gpa_space(vms->highest_gpa, vms->bus);
 
     create_measurement_log(vms);
+
+    // hwaddr ram_size = machine->ram_size;
+    // if(virt_machine_is_confidential(vms)){
+    //     ram_size += 32 * KiB; // add space for ivshmem memory
+    // }
 
     vms->bootinfo.ram_size = machine->ram_size;
     vms->bootinfo.board_id = -1;
