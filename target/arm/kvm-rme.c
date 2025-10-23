@@ -612,8 +612,8 @@ static int rme_create_realm(Error **errp)
         return -1;
     }
 
-    ret = kvm_vm_enable_cap(kvm_state, KVM_CAP_ARM_RME, 0,
-                            KVM_CAP_ARM_RME_CUSTOM_PRINT);
+    // ret = kvm_vm_enable_cap(kvm_state, KVM_CAP_ARM_RME, 0,
+    //                         KVM_CAP_ARM_RME_CUSTOM_PRINT);
 
     kvm_mark_guest_state_protected();
     return 0;
@@ -691,20 +691,6 @@ static void rme_set_measurement_log(Object *obj, bool value, Error **errp)
     guest->use_measurement_log = value;
 }
 
-// static bool rme_get_shmem_prot(Object *obj, Error **errp)
-// {
-//     RmeGuest *guest = RME_GUEST(obj);
-
-//     return guest->use_shmem_prot;
-// }
-
-// static void rme_set_shmem_prot(Object *obj, bool value, Error **errp)
-// {
-//     RmeGuest *guest = RME_GUEST(obj);
-
-//     guest->use_shmem_prot = value;
-// }
-
 static void rme_guest_class_init(ObjectClass *oc, const void *data)
 {
     object_class_property_add_str(oc, "personalization-value", rme_get_rpv,
@@ -725,11 +711,6 @@ static void rme_guest_class_init(ObjectClass *oc, const void *data)
                                    rme_set_measurement_log);
     object_class_property_set_description(oc, "measurement-log",
             "Enable/disable Realm measurement log");
-    // object_class_property_add_bool(oc, "shmem-prot",
-    //                                rme_get_shmem_prot,
-    //                                rme_set_shmem_prot);
-    // object_class_property_set_description(oc, "shmem-prot",
-    //         "Enable/disable protected shared memory");
 }
 
 static void rme_guest_init(Object *obj)
@@ -1062,4 +1043,46 @@ Object *kvm_arm_rme_get_measurement_log(void)
         return OBJECT(rme_guest->log);
     }
     return NULL;
+}
+
+static inline uint64_t shared_bit(unsigned ipa_bits) {
+    return 1ULL << (ipa_bits - 1);
+}
+static inline uint64_t to_private_ipa(uint64_t ipa_any, unsigned ipa_bits) {
+    return ipa_any & (shared_bit(ipa_bits) - 1);
+}
+static inline uint64_t to_shared_ipa(uint64_t ipa_priv, unsigned ipa_bits) {
+    return ipa_priv | shared_bit(ipa_bits);
+}
+
+int kvm_arm_rme_set_protected_shared_range(uint64_t start, uint64_t size, Error **errp)
+{
+    if (!rme_guest || !rme_guest->ipa_bits || !size) {
+        error_setg(errp, "RME: invalid state/args for private shared range");
+        return -EINVAL;
+    }
+
+    warn_report("RME: requested private shared range ipa=0x%"HWADDR_PRIx", size=0x%llx\n",
+                start, size);
+
+    uint64_t priv  = to_private_ipa(start, rme_guest->ipa_bits);
+    uint64_t shared = to_shared_ipa(priv, rme_guest->ipa_bits);
+
+    hwaddr ipa = QEMU_ALIGN_DOWN(shared, RME_PAGE_SIZE);
+
+    warn_report("RME: requested private shared range ipa=0x%"HWADDR_PRIx", size=0x%llx, with IPA_BITS=%d\n",
+                ipa, size, rme_guest->ipa_bits);
+
+    struct arm_rme_protected_shared_range args = { .ipa = ipa, .size = size };
+
+    int ret = kvm_vm_enable_cap(kvm_state, KVM_CAP_ARM_RME, 0,
+                                KVM_CAP_ARM_RME_SET_PROTECTED_SHARED_RANGE,
+                                (intptr_t)&args);
+    if (ret) {
+        error_setg_errno(errp, -ret,
+                         "RME: failed to set private shared range ipa=0x%"HWADDR_PRIx", size=0x%llx",
+                         ipa, size);
+        return ret;
+    }
+    return 0;
 }

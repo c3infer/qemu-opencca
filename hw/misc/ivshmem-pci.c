@@ -40,6 +40,7 @@
 #include "hw/misc/ivshmem.h"
 #include "qom/object.h"
 
+#include "target/arm/kvm_arm.h"
 
 #define PCI_VENDOR_ID_IVSHMEM   PCI_VENDOR_ID_REDHAT_QUMRANET
 #define PCI_DEVICE_ID_IVSHMEM   0x1110
@@ -121,6 +122,7 @@ struct IVShmemState {
 
     /*protected*/
     bool protected;
+    bool prot_shared_applied;
 };
 
 /* registers for the Inter-VM shared memory device */
@@ -894,16 +896,45 @@ static void ivshmem_disable_irqfd(IVShmemState *s)
 
 }
 
-/* Put this somewhere near your device code */
-// #define FIXED_GPA  (0x0000000050000000ULL)
+static void ivshmem_rme_set_protected_shared_ranges(IVShmemState *s)
+{
+    if (!kvm_enabled()) {
+        return;
+    }
 
-// /* tiny helper: does a cfg write [address, address+len) touch [off, off+sz)? */
-// static inline bool overlaps(unsigned address, int len, unsigned off, unsigned sz)
-// {
-//     unsigned a0 = address, a1 = address + len;
-//     unsigned b0 = off,     b1 = off + sz;
-//     return !(a1 <= b0 || b1 <= a0);
-// }
+    /* BAR2 must exist and be mapped by the guest (has a GPA). */
+    PCIDevice *pdev = PCI_DEVICE(s);
+
+    /* Get the guest-physical base of BAR2 (64-bit BAR) */
+    pcibus_t bar_base = pci_get_bar_addr(pdev, 2);
+    warn_report("BAR2 GPA=0x%" PRIx64 " size=0x%" PRIx64 "\n",
+                    (uint64_t)bar_base, (uint64_t)memory_region_size(s->ivshmem_bar2));
+    if (bar_base == PCI_BAR_UNMAPPED) {
+        return; /* guest hasn't assigned it yet */
+    }
+
+    /* Size is the shared memory window size (e.g. 2 MiB) */
+    uint64_t bar_size = memory_region_size(s->ivshmem_bar2);
+
+    /* Align IPA down and size up to host page size (QEMU will do the right thing) */
+    uint64_t page = qemu_real_host_page_size();
+    uint64_t start = QEMU_ALIGN_DOWN(bar_base, page);
+    uint64_t end   = QEMU_ALIGN_UP(bar_base + bar_size, page);
+    uint64_t size  = end - start;
+
+    Error *err = NULL;
+    if (kvm_arm_rme_set_protected_shared_range(start, size, &err)) {
+        /* Didn’t succeed: warn and keep trying only once to avoid spam */
+        if (err) {
+            warn_report_err(err);
+        }
+        return;
+    }
+
+    s->prot_shared_applied = true;  /* success: only do it once */
+    warn_report("PROTECTED_SHARED range set for BAR2: [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+                    (uint64_t)start, (uint64_t)end);
+}
 
 static void ivshmem_write_config(PCIDevice *pdev, uint32_t address,
                                  uint32_t val, int len)
@@ -911,47 +942,20 @@ static void ivshmem_write_config(PCIDevice *pdev, uint32_t address,
     IVShmemState *s = IVSHMEM_COMMON(pdev);
     int was_enabled = msix_enabled(pdev);
 
-    // /* ---- Intercept BAR2 writes and force a GPA via default handler ---- */
-    // const int bar_index = 2;                       /* ivshmem data BAR */
-    // const unsigned off = pci_bar(pdev, bar_index); /* cfg-space offset of BAR2 */
-    // PCIIORegion *r = &pdev->io_regions[bar_index];
+    // if(s->protected && !s->prot_shared_applied) {
+    //     /* If BAR2 (64-bit) or COMMAND gets written, try to apply WO. */
+    //     /* BAR2 low dword:  0x18, BAR2 high dword: 0x1C */
+    //     bool bar2_written =
+    //         ranges_overlap(address, len, PCI_BASE_ADDRESS_2, 4) ||
+    //         ranges_overlap(address, len, PCI_BASE_ADDRESS_3, 4);
+    //     bool cmd_written = ranges_overlap(address, len, PCI_COMMAND, 2);
 
-    // /* Only care if this write hits BAR2 (low or high dword). */
-    // if(s->protected) {
-    //     if (r->size && overlaps(address, len, off, 4)) {
-    //         /* low dword write */
-    //         /* If this is a sizing write (all 1s), pass through unchanged. */
-    //         if (!(len == 4 && val == 0xFFFFFFFFu)) {
-    //             if (r->type & PCI_BASE_ADDRESS_SPACE_IO) {
-    //                 /* (unlikely for ivshmem data window) */
-    //                 uint32_t forced = (r->type & ~PCI_BASE_ADDRESS_IO_MASK) |
-    //                                 (uint32_t)(FIXED_GPA & PCI_BASE_ADDRESS_IO_MASK);
-    //                 val = forced;
-    //             } else {
-    //                 /* memory BAR */
-    //                 uint64_t mask = ~((uint64_t)r->size - 1) & PCI_BASE_ADDRESS_MEM_MASK;
-    //                 uint32_t forced_low =
-    //                     (r->type & ~PCI_BASE_ADDRESS_MEM_MASK) |
-    //                     (uint32_t)((FIXED_GPA & mask) & 0xFFFFFFFFu);
-    //                 val = forced_low;
-    //             }
-    //         }
-    //         pci_default_write_config(pdev, address, val, len);
-    //     } else if (r->size && (r->type & PCI_BASE_ADDRESS_MEM_TYPE_64) &&
-    //             overlaps(address, len, off + 4, 4)) {
-    //         /* high dword write of a 64-bit BAR */
-    //         if (!(len == 4 && val == 0xFFFFFFFFu)) {
-    //             uint64_t mask = ~((uint64_t)r->size - 1) & PCI_BASE_ADDRESS_MEM_MASK;
-    //             uint32_t forced_high = (uint32_t)(((FIXED_GPA & mask) >> 32) & 0xFFFFFFFFu);
-    //             val = forced_high;
-    //         }
-    //         pci_default_write_config(pdev, address, val, len);
-    //     } 
+    //     if (bar2_written || cmd_written) {
+    //         ivshmem_rme_set_protected_shared_ranges(s);
+    //     }
     // }
-    // else {
-        /* Not BAR2: normal handling. This still covers ROM BAR, command, MSI-X, etc. */
+
     pci_default_write_config(pdev, address, val, len);
-    // }
 
     /* ---- ivshmem-specific MSI-X irqfd toggling (unchanged) ---- */
     int is_enabled = msix_enabled(pdev);

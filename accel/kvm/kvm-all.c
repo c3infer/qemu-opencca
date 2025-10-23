@@ -55,6 +55,8 @@
 
 #include "hw/misc/ivshmem-pci.h" //to add
 
+#include "target/arm/kvm_arm.h" //for rme
+
 /* This check must be after config-host.h is included */
 #ifdef CONFIG_EVENTFD
 #include <sys/eventfd.h>
@@ -1492,11 +1494,6 @@ static int kvm_set_memory_attributes(hwaddr start, uint64_t size, uint64_t attr)
     return r;
 }
 
-// int kvm_set_memory_attributes_private_shared_committed(hwaddr start, uint64_t size)
-// {
-//     return kvm_set_memory_attributes(start, size, KVM_MEMORY_ATTRIBUTE_PRIVATE_SHARED_COMMITTED);
-// }
-
 int kvm_set_memory_attributes_private_shared(hwaddr start, uint64_t size)
 {
     return kvm_set_memory_attributes(start, size, KVM_MEMORY_ATTRIBUTE_PRIVATE_SHARED);
@@ -1620,6 +1617,23 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
         }
 
         if (memory_region_has_guest_memfd(mr)) {
+            if (ivshmem_bar2_is_protected(mr)) {
+                // uint8_t *base = NULL;
+                // if (memory_region_is_ram(mr) && !memory_region_is_ram_device(mr)) {
+                //     base = memory_region_get_ram_ptr(mr);
+                //     // add your offset within the region if needed
+                // }
+                
+                Error *errp = NULL;
+                if (kvm_arm_rme_set_protected_shared_range((uint64_t) start_addr, (uint64_t) slot_size, &errp)) {
+                    /* Didn’t succeed: warn and keep trying only once to avoid spam */
+                    if (err) {
+                        warn_report("Failed to set RME protected shared range at "
+                                    "0x%" HWADDR_PRIx " (size 0x%" PRIx64 "): %s",
+                                    start_addr, slot_size, error_get_pretty(errp));
+                    }
+                }
+            }
             err = kvm_set_memory_attributes_private(start_addr, slot_size);
             if (err) {
                 error_report("%s: failed to set memory attribute private: %s",

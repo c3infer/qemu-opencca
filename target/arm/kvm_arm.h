@@ -278,6 +278,15 @@ void kvm_arm_rme_init_guest_ram(hwaddr base, size_t size);
  */
 void kvm_arm_rme_init_gpa_space(hwaddr highest_gpa, PCIBus *pci_bus);
 
+/*
+* kvm_arm_rme_set_protected_shared_range
+* @start: start IPA of the protected shared range
+* @size: size of the protected shared range
+* @errp: pointer to Error* for error propagation
+*/
+
+int kvm_arm_rme_set_protected_shared_range(uint64_t start, uint64_t size, Error **errp);
+
 /**
  * kvm_arm_rme_get_measurement_log
  *
@@ -287,7 +296,5 @@ void kvm_arm_rme_init_gpa_space(hwaddr highest_gpa, PCIBus *pci_bus);
  * Returns NULL if measurement log is disabled.
  */
 Object *kvm_arm_rme_get_measurement_log(void);
-
-int kvm_arm_rme_set_prot_range(hwaddr ipa, hwaddr size, Error **errp);
 
 #endif
