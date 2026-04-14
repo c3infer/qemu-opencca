@@ -956,6 +956,14 @@ bool write_kvmstate_to_list(ARMCPU *cpu)
     int i;
     bool ok = true;
 
+    /*
+     * Realm vCPUs may not expose the generic cpreg one-reg list prior to
+     * REC finalization/activation. Skip this legacy sync path for Realm.
+     */
+    if (cpu->kvm_rme) {
+        return true;
+    }
+
     for (i = 0; i < cpu->cpreg_array_len; i++) {
         uint64_t regidx = cpu->cpreg_indexes[i];
         uint32_t v32;
@@ -2007,6 +2015,16 @@ int kvm_arch_init_vcpu(CPUState *cs)
     }
 
     /*
+     * Realm vCPUs are finalized later via KVM_ARM_VCPU_FINALIZE(REC) in
+     * kvm-rme.c. Some host kernels do not expose the regular one-reg
+     * interface for this pre-finalize Realm vCPU state, so skip generic
+     * PSCI/MPIDR/cpreg probing in this path.
+     */
+    if (cpu->kvm_rme) {
+        return 0;
+    }
+
+    /*
      * KVM reports the exact PSCI version it is implementing via a
      * special sysreg. If it is present, use its contents to determine
      * what to report to the guest in the dtb (it is the PSCI version,
@@ -2272,6 +2290,14 @@ int kvm_arch_put_registers(CPUState *cs, int level, Error **errp)
     ret = kvm_arm_put_core_regs(cs, level, errp);
     if (ret) {
         return ret;
+    }
+
+    /*
+     * Realm vCPUs use a constrained register ABI; the generic cpreg list and
+     * VCPU event sync paths may be rejected by the kernel.
+     */
+    if (cpu->kvm_rme) {
+        return 0;
     }
 
     write_cpustate_to_list(cpu, true);

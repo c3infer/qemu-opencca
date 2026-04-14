@@ -937,7 +937,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_ARM_EL2 240
 #define KVM_CAP_ARM_EL2_E2H0 241
 #define KVM_CAP_RISCV_MP_STATE_RESET 242
-#define KVM_CAP_ARM_RME 243
+#define KVM_CAP_ARM_RME 300 /* keep aligned with host-linux-opencca UAPI */
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
@@ -1598,6 +1598,6 @@ struct kvm_arm_rmm_psci_complete {
 	__u32 padding[3];
 };
 
-#define KVM_ARM_VCPU_RMM_PSCI_COMPLETE	_IOW(KVMIO, 0xd6, struct kvm_arm_rmm_psci_complete)
+#define KVM_ARM_VCPU_RMM_PSCI_COMPLETE	_IOW(KVMIO, 0xd2, struct kvm_arm_rmm_psci_complete)
 
 #endif /* __LINUX_KVM_H */

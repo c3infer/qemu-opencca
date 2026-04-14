@@ -834,7 +834,11 @@ int kvm_arm_rme_vcpu_init(CPUState *cs)
 
     if (rme_guest) {
         cpu->kvm_rme = true;
-        cpu->kvm_init_features[0] |= (1 << KVM_ARM_VCPU_REC);
+        /*
+         * Some kernels reject REC as a KVM_ARM_VCPU_INIT feature bit and only
+         * support REC creation via KVM_ARM_VCPU_FINALIZE(KVM_ARM_VCPU_REC).
+         * Keep Realm mode enabled in QEMU and defer REC creation to finalize.
+         */
     }
     return 0;
 }
